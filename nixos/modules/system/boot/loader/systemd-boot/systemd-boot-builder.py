@@ -1107,7 +1107,7 @@ def install_bootloader_staged(args: argparse.Namespace, work: Path) -> None:
     (BOOT_MOUNT_POINT / NIXOS_DIR).mkdir(parents=True, exist_ok=True)
     (BOOT_MOUNT_POINT / "loader/entries").mkdir(parents=True, exist_ok=True)
 
-    default_config = Path(args.default_config)
+    default_config = Path(args.default_config).resolve()
     requested = default_config if UKI_CONFIG["enable"] else None
     gens = get_generations(default_config=requested)
     for profile in get_profiles():
