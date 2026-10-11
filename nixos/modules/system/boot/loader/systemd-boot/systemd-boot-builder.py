@@ -749,9 +749,8 @@ def uki_boot_file(
     extra_error = None
     for extra in bootspec.extraInitrdPaths:
         if extra.is_absolute() or ".." in extra.parts:
-            raise ValueError(
-                f"Extra initrd path must be boot-partition-relative: {extra}"
-            )
+            extra_error = f"Extra initrd path must be boot-partition-relative: {extra}"
+            break
         source = Path(
             bootspec.extraInitrdSources.get(str(extra), str(BOOT_MOUNT_POINT / extra))
         )
