@@ -207,8 +207,9 @@ in
           Each image contains its own kernel and initrd, including initrd secrets.
           Allow sufficient space on the boot filesystem for all retained images
           and in `TMPDIR` for new images and assembly scratch files. Unchanged
-          installed images are verified and reused; they do not accumulate in
-          temporary storage. Set `TMPDIR` to a larger filesystem if necessary.
+          installed images are verified and reused, and damaged ones are
+          rebuilt; they do not accumulate in temporary storage. Set `TMPDIR` to
+          a larger filesystem if necessary.
           Existing images are pruned only after new images and entries are installed.
           Reserve free boot space for replacing every retained image after a
           systemd update. Generate byte-reproducible extra archives to avoid

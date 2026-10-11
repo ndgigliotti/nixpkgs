@@ -70,9 +70,10 @@ class WriteBootFile(Protocol):
 @dataclass
 class CopyWriter:
     source: Path
+    replace: bool = False
 
     def write_boot_file(self, path: Path, *, critical: bool) -> None:
-        if path.exists():
+        if path.exists() and not self.replace:
             return
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -859,21 +860,26 @@ def uki_boot_file(
     del expected, sections, payload, stub_sections, stub_payload, contents, retained
     relative = NIXOS_DIR / f"{identifier}-uki.efi"
     installed = BOOT_MOUNT_POINT / relative
+    damaged = False
     if installed.exists():
-        verify_signature(installed)
-        if uki_identifier(PEImage.read(installed)) != identifier:
-            raise ValueError(
-                f"Existing UKI contents do not match their name: {installed}"
-            )
-        shutil.rmtree(directory)
-        return BootFile(relative, CopyWriter(installed))
+        try:
+            verify_signature(installed)
+            damaged = uki_identifier(PEImage.read(installed)) != identifier
+        except (ValueError, subprocess.CalledProcessError):
+            damaged = True
+        if not damaged:
+            shutil.rmtree(directory)
+            return BootFile(relative, CopyWriter(installed))
+        # The name is the verified identity of the new image, so publishing it
+        # over a corrupted or tampered file restores the expected contents.
+        print(f"warning: replacing damaged UKI {installed}", file=sys.stderr)
     # Keep only unique, new, verified images until publication. Reinstalling
     # retained generations no longer accumulates images or scratch initrds.
     staged = work / relative.name
     if not staged.exists():
         image.rename(staged)
     shutil.rmtree(directory)
-    return BootFile(relative, CopyWriter(staged))
+    return BootFile(relative, CopyWriter(staged, replace=damaged))
 
 
 def boot_file(
@@ -1015,10 +1021,13 @@ def check_uki_space(boot_files: BootFileList) -> None:
     required = 1024 * 1024  # Directory entries and filesystem metadata.
     seen: set[Path] = set()
     for boot_file in boot_files:
-        if boot_file.path in seen or (BOOT_MOUNT_POINT / boot_file.path).exists():
+        writer = boot_file.writer
+        replace = isinstance(writer, CopyWriter) and writer.replace
+        if boot_file.path in seen or (
+            (BOOT_MOUNT_POINT / boot_file.path).exists() and not replace
+        ):
             continue
         seen.add(boot_file.path)
-        writer = boot_file.writer
         if isinstance(writer, CopyWriter):
             size = writer.source.stat().st_size
         elif isinstance(writer, ContentsWriter):

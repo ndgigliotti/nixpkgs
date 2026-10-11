@@ -406,16 +406,20 @@ in
         first_image = image_for(2)
         machine.succeed("rm /root/uki-secret-first")
 
-    with subtest("A corrupted existing UKI is refused before menu/default changes"):
-        machine.succeed(f"cp {shlex.quote(second_image)} /root/original.efi")
-        machine.succeed(f"printf X | dd of={shlex.quote(second_image)} bs=1 seek=512 count=1 conv=notrunc")
+    def check_replaced(image):
+        output = machine.succeed(f"{second}/bin/switch-to-configuration boot 2>&1")
+        assert f"replacing damaged UKI {image}" in output, output
+        # A repaired image verifies against its name, so reinstalling is a no-op.
         before = snapshot()
-        machine.fail(f"{second}/bin/switch-to-configuration boot")
+        output = machine.succeed(f"{second}/bin/switch-to-configuration boot 2>&1")
+        assert "replacing damaged UKI" not in output, output
         assert snapshot() == before
-        machine.succeed(f"cp /root/original.efi {shlex.quote(second_image)}")
 
-    with subtest("Malformed optional headers and duplicate zero-sized sections are refused"):
-        machine.succeed(f"cp {shlex.quote(second_image)} /root/pe-original.efi")
+    with subtest("A corrupted existing UKI is replaced by its verified rebuild"):
+        machine.succeed(f"printf X | dd of={shlex.quote(second_image)} bs=1 seek=512 count=1 conv=notrunc")
+        check_replaced(second_image)
+
+    with subtest("Malformed optional headers and duplicate zero-sized sections are replaced"):
         for mutation in ("short_header", "missing_directory", "duplicate_empty_section"):
             script = (
                 "import struct; "
@@ -429,10 +433,7 @@ in
             else:
                 script += "table=opt+struct.unpack_from('<H',h,pe+20)[0]; f.seek(table); f.write(b'.cmdline'); f.seek(table+16); f.write(struct.pack('<I',0))"
             machine.succeed("${pkgs.python3}/bin/python3 -c " + shlex.quote(script))
-            before = snapshot()
-            machine.fail(f"{second}/bin/switch-to-configuration boot")
-            assert snapshot() == before
-            machine.succeed(f"cp /root/pe-original.efi {shlex.quote(second_image)}")
+            check_replaced(second_image)
 
     ${lib.optionalString signed ''
       with subtest("A trusted but different manager is refused before publication"):
