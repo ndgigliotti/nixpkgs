@@ -75,19 +75,26 @@ class CopyWriter:
     def write_boot_file(self, path: Path, *, critical: bool) -> None:
         if path.exists() and not self.replace:
             return
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=path.parent,
-            delete=False,
-            prefix=path.name,
-            suffix=".tmp",
-        ) as tmp:
-            with open(self.source, mode="rb") as source_file:
+        copy_atomically(self.source, path)
+
+
+def copy_atomically(source: Path, path: Path) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=path.parent,
+        delete=False,
+        prefix=path.name,
+        suffix=".tmp",
+    ) as tmp:
+        try:
+            with open(source, mode="rb") as source_file:
                 shutil.copyfileobj(source_file, tmp)
             tmp.flush()
             os.fsync(tmp.fileno())
-            tmp.close()
-            os.rename(tmp.name, path)
+        except BaseException:
+            os.unlink(tmp.name)
+            raise
+    os.rename(tmp.name, path)
 
 
 @dataclass
@@ -542,9 +549,13 @@ class PEImage:
         return identity.hexdigest()
 
 
+def sbverify_command(path: Path) -> list[str | Path]:
+    return [UKI_CONFIG["sbverify"], "--cert", UKI_CONFIG["certificate"], path]
+
+
 def verify_signature(path: Path) -> None:
     if UKI_CONFIG["certificate"] is not None:
-        run([UKI_CONFIG["sbverify"], "--cert", UKI_CONFIG["certificate"], path])
+        run(sbverify_command(path))
 
 
 def check_signing_inputs() -> None:
@@ -591,20 +602,90 @@ def check_signing_inputs() -> None:
     UKI_CONFIG["certificate"] = str(certificate)
 
 
-def check_signed_managers() -> None:
+def manager_version(data: bytes) -> str | None:
+    # Read the marker from raw bytes, as bootctl does, so a damaged or
+    # unusually signed systemd-boot is still recognized and replaced.
+    match = re.search(rb"#### LoaderInfo: systemd-boot (\S+) ####", data)
+    return match.group(1).decode(errors="surrogateescape") if match else None
+
+
+def is_signed(path: Path) -> bool:
+    # Quiet probe: unsigned managers are expected before the first signed install.
+    return subprocess.run(sbverify_command(path), capture_output=True).returncode == 0
+
+
+def is_current_manager(path: Path, expected: str) -> bool:
+    try:
+        return PEImage.read(path).digest() == expected
+    except ValueError:
+        return False
+
+
+def is_newer_version(version: str, than: str) -> bool:
+    # Use systemd's own version ordering, as bootctl update does.
+    command = [
+        UKI_CONFIG["systemdAnalyze"],
+        "compare-versions",
+        version,
+        "gt",
+        than,
+    ]
+    return subprocess.run(command).returncode == 0
+
+
+def stage_signed_managers(work: Path) -> list[tuple[Path, Path]]:
+    # Keep a manager signed with the UKI key that is this build or newer, and
+    # leave a foreign fallback loader alone. Replace anything else, even a newer
+    # manager without this signature, with this build signed by the UKI key.
     arch = UKI_CONFIG["efiArch"]
     source = Path(SYSTEMD) / f"lib/systemd/boot/efi/systemd-boot{arch}.efi"
     expected = PEImage.read(source).digest()
-    for relative in (
-        f"EFI/systemd/systemd-boot{arch}.efi",
-        f"EFI/BOOT/BOOT{arch.upper()}.EFI",
+    version = manager_version(source.read_bytes())
+    if version is None:
+        raise ValueError(f"Not a systemd-boot image: {source}")
+    signed = work / source.name
+    updates = []
+    for relative, fallback in (
+        (f"EFI/systemd/systemd-boot{arch}.efi", False),
+        (f"EFI/BOOT/BOOT{arch.upper()}.EFI", True),
     ):
         installed = EFI_SYS_MOUNT_POINT / relative
-        verify_signature(installed)
-        if PEImage.read(installed).digest() != expected:
-            raise ValueError(
-                f"Signed manager {installed} differs from {source}; provision this systemd.package manager signed with {UKI_CONFIG['certificate']} separately before installing the generation"
+        installed_version = (
+            manager_version(installed.read_bytes()) if installed.exists() else None
+        )
+        if installed_version is None:
+            if fallback and installed.exists():
+                continue
+        elif is_signed(installed) and (
+            is_current_manager(installed, expected)
+            or is_newer_version(installed_version, version)
+        ):
+            continue
+        if not signed.exists():
+            run(
+                [
+                    UKI_CONFIG["sbsign"],
+                    "--key",
+                    UKI_CONFIG["privateKey"],
+                    "--cert",
+                    UKI_CONFIG["certificate"],
+                    "--output",
+                    signed,
+                    source,
+                ]
             )
+            verify_signature(signed)
+            if PEImage.read(signed).digest() != expected:
+                raise ValueError(f"Signed manager does not match {source}")
+        updates.append((signed, installed))
+    return updates
+
+
+def install_signed_managers(updates: list[tuple[Path, Path]]) -> None:
+    for signed, installed in updates:
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        copy_atomically(signed, installed)
+        print(f'Installed signed "{signed.name}" to "{installed}".', file=sys.stderr)
 
 
 def uki_identifier(image: PEImage) -> str:
@@ -1015,10 +1096,26 @@ def install_bootloader(args: argparse.Namespace) -> None:
         install_bootloader_staged(args, Path(directory))
 
 
-def check_uki_space(boot_files: BootFileList) -> None:
-    filesystem = os.statvfs(BOOT_MOUNT_POINT)
+def check_space(mount_point: Path, sizes: list[int], what: str) -> None:
+    filesystem = os.statvfs(mount_point)
     cluster = filesystem.f_frsize
     required = 1024 * 1024  # Directory entries and filesystem metadata.
+    for size in sizes:
+        required += ((size + cluster - 1) // cluster + 1) * cluster
+    if required > filesystem.f_bavail * cluster:
+        raise OSError(errno.ENOSPC, f"Insufficient boot filesystem space for {what}")
+
+
+def check_uki_space(
+    boot_files: BootFileList, manager_updates: list[tuple[Path, Path]]
+) -> None:
+    # Replaced managers need room for a full temporary copy before rename.
+    managers = [signed.stat().st_size for signed, _ in manager_updates]
+    sizes: list[int] = []
+    if EFI_SYS_MOUNT_POINT == BOOT_MOUNT_POINT:
+        sizes += managers
+    elif managers:
+        check_space(EFI_SYS_MOUNT_POINT, managers, "signed boot managers")
     seen: set[Path] = set()
     for boot_file in boot_files:
         writer = boot_file.writer
@@ -1034,11 +1131,8 @@ def check_uki_space(boot_files: BootFileList) -> None:
             size = len(writer.contents)
         else:
             raise TypeError("Unexpected UKI writer")
-        required += ((size + cluster - 1) // cluster + 1) * cluster
-    if required > filesystem.f_bavail * cluster:
-        raise OSError(
-            errno.ENOSPC, "Insufficient boot filesystem space for staged UKIs"
-        )
+        sizes.append(size)
+    check_space(BOOT_MOUNT_POINT, sizes, "staged UKIs")
 
 
 def update_boot_manager() -> None:
@@ -1091,8 +1185,9 @@ def update_boot_manager() -> None:
 
 def install_bootloader_staged(args: argparse.Namespace, work: Path) -> None:
     check_signing_inputs()
-    if UKI_CONFIG["privateKey"] is not None:
-        check_signed_managers()
+    manager_updates = (
+        stage_signed_managers(work) if UKI_CONFIG["privateKey"] is not None else []
+    )
     try:
         with open("/etc/machine-id") as machine_file:
             machine_id = machine_file.readlines()[0].strip()
@@ -1186,10 +1281,11 @@ def install_bootloader_staged(args: argparse.Namespace, work: Path) -> None:
         )
 
     if UKI_CONFIG["enable"]:
-        check_uki_space(boot_files)
+        check_uki_space(boot_files, manager_updates)
 
     if UKI_CONFIG["enable"] and UKI_CONFIG["privateKey"] is None:
         update_boot_manager()
+    install_signed_managers(manager_updates)
 
     # Garbage-collect stale kernels/initrds/entries before re-populating extra
     # files, so that user-supplied extraEntries (which may also live under

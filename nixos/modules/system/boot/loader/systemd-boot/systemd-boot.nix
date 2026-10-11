@@ -12,6 +12,12 @@ let
 
   efi = config.boot.loader.efi;
 
+  # Tools run against the selected systemd's stub and managers at install time.
+  ukiSystemd = config.systemd.package.override {
+    withUkify = true;
+    withAnalyze = true;
+  };
+
   # We check the source code in a derivation that does not depend on the
   # system configuration so that most users don't have to redo the check and require
   # the necessary dependencies.
@@ -108,14 +114,11 @@ let
         builtins.toJSON {
           inherit (cfg.uki) enable;
           inherit (pkgs.stdenv.hostPlatform) efiArch;
-          ukify =
-            if cfg.uki.enable then
-              "${config.systemd.package.override { withUkify = true; }}/lib/systemd/ukify"
-            else
-              "";
+          ukify = if cfg.uki.enable then "${ukiSystemd}/lib/systemd/ukify" else "";
           inherit (cfg.uki) privateKey certificate;
           sbsign = if cfg.uki.privateKey != null then "${pkgs.sbsigntool}/bin/sbsign" else "";
           sbverify = if cfg.uki.privateKey != null then "${pkgs.sbsigntool}/bin/sbverify" else "";
+          systemdAnalyze = if cfg.uki.privateKey != null then "${ukiSystemd}/bin/systemd-analyze" else "";
         }
       );
     };
@@ -246,13 +249,15 @@ in
           and writable only by root. Set {option}`boot.loader.systemd-boot.uki.certificate`
           alongside it. When null, UKIs are installed unsigned.
 
-          Signing requires an existing systemd-boot manager signed with this
-          certificate, matching {option}`systemd.package`, at both the normal
-          and fallback EFI paths. The installer verifies and
-          preserves those managers; it refuses manager upgrades. Key enrollment
-          and manager provisioning, including firmware boot entry registration,
-          are separate administrative steps. In signed mode the installer does
-          not run `bootctl install/update`, touch EFI variables or apply
+          The installer also signs the systemd-boot manager from
+          {option}`systemd.package` with this key and installs it at the
+          normal and fallback EFI paths unless the installed manager is
+          signed with this certificate and is either the same build or a newer
+          version. Other managers are replaced even if newer. A fallback loader
+          that is not systemd-boot is kept.
+          Key enrollment and firmware boot entry registration are separate
+          administrative steps. In signed mode the installer does not run
+          `bootctl install/update`, touch EFI variables or apply
           {option}`boot.loader.systemd-boot.graceful`.
 
           Retired runtime secrets are preserved from authenticated installed

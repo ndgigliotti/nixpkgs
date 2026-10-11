@@ -185,6 +185,7 @@ in
     recovery = "${nodes.first.specialisation.recovery.configuration.system.build.toplevel}"
     certificate = "/var/lib/sbctl/keys/db/db.pem"
     esp = "${if xbootldr then "/efi" else "/boot"}"
+    managers = [f"{esp}/EFI/systemd/systemd-bootx64.efi", f"{esp}/EFI/BOOT/BOOTX64.EFI"]
 
     def check_boot(system_path, marker, generation, specialisation=False):
         machine.wait_for_unit("multi-user.target")
@@ -237,9 +238,8 @@ in
           assert snapshot() == before
 
       # All enrollment and signing happen exclusively in this disposable guest.
+      # The installer signs the boot managers itself.
       machine.succeed("sbctl create-keys")
-      machine.succeed(f"sbctl sign {esp}/EFI/systemd/systemd-bootx64.efi")
-      machine.succeed(f"sbctl sign {esp}/EFI/BOOT/BOOTX64.EFI")
       machine.succeed("sbctl enroll-keys --yes-this-might-brick-my-machine")
 
       with subtest("A readable signing key is refused before publication"):
@@ -290,6 +290,8 @@ in
         machine.succeed(f"grep -F 'init={first}/init' /root/cmdline")
         ${lib.optionalString signed ''
           machine.succeed(f"sbverify --cert {certificate} {shlex.quote(first_image)}")
+          for manager in managers:
+              machine.succeed(f"${pkgs.sbsigntool}/bin/sbverify --cert {certificate} {manager}")
         ''}
         machine.reboot()
         check_boot(first, "uki.test=first", 2)
@@ -355,8 +357,6 @@ in
       with subtest("Signing-mode changes tolerate unavailable historical secrets"):
           error = machine.succeed(f"${nodes.unsignedInstaller.system.build.installBootLoader} {second} 2>&1")
           assert "ignoring unusable retained UKI" in error, error
-          machine.succeed(f"${lib.getExe pkgs.sbctl} sign {esp}/EFI/systemd/systemd-bootx64.efi")
-          machine.succeed(f"${lib.getExe pkgs.sbctl} sign {esp}/EFI/BOOT/BOOTX64.EFI")
           error = machine.succeed(f"{second}/bin/switch-to-configuration boot 2>&1")
           assert "ignoring unusable retained UKI" in error, error
           machine.succeed("printf 'disposable-uki-fixture\\n' > /root/uki-secret-first")
@@ -436,18 +436,31 @@ in
             check_replaced(second_image)
 
     ${lib.optionalString signed ''
-      with subtest("A trusted but different manager is refused before publication"):
-          manager = f"{esp}/EFI/systemd/systemd-bootx64.efi"
-          machine.succeed(f"cp {manager} /root/original-manager.efi")
-          machine.succeed("cp ${nodes.first.systemd.package}/lib/systemd/boot/efi/systemd-bootx64.efi /root/stale-manager.efi")
-          machine.succeed(r"sed -i 's/#### LoaderInfo: systemd-boot [0-9]/#### LoaderInfo: systemd-boot 0/' /root/stale-manager.efi")
-          machine.succeed(f"${pkgs.sbsigntool}/bin/sbsign --key /var/lib/sbctl/keys/db/db.key --cert {certificate} --output {manager} /root/stale-manager.efi")
-          machine.succeed(f"${pkgs.sbsigntool}/bin/sbverify --cert {certificate} {manager}")
+      with subtest("Older or unsigned managers are replaced; newer trusted managers are kept"):
+          source = "${nodes.first.systemd.package}/lib/systemd/boot/efi/systemd-bootx64.efi"
+          current = "LoaderInfo: systemd-boot ${nodes.first.systemd.package.version} "
+
+          def fixture(digit, path):
+              machine.succeed(f"cp {source} /root/manager.efi")
+              machine.succeed(rf"sed -i 's/#### LoaderInfo: systemd-boot [0-9]/#### LoaderInfo: systemd-boot {digit}/' /root/manager.efi")
+              machine.succeed(f"${pkgs.sbsigntool}/bin/sbsign --key /var/lib/sbctl/keys/db/db.key --cert {certificate} --output {path} /root/manager.efi")
+
+          fixture(0, managers[0])
+          machine.succeed(f"cp {source} {managers[1]}")
+          output = machine.succeed(f"{second}/bin/switch-to-configuration boot 2>&1")
+          for manager in managers:
+              assert f'to "{manager}"' in output, output
+              machine.succeed(f"${pkgs.sbsigntool}/bin/sbverify --cert {certificate} {manager}")
+              machine.succeed(f"grep -aF {shlex.quote(current)} {manager}")
+
+          fixture(9, managers[0])
           before = snapshot()
-          error = machine.fail(f"{second}/bin/switch-to-configuration boot 2>&1")
-          assert manager in error and "${nodes.first.systemd.package}" in error, error
+          output = machine.succeed(f"{second}/bin/switch-to-configuration boot 2>&1")
+          assert "Installed signed" not in output, output
           assert snapshot() == before
-          machine.succeed(f"cp /root/original-manager.efi {manager}")
+          fixture(0, managers[0])
+          machine.succeed(f"{second}/bin/switch-to-configuration boot")
+          machine.succeed(f"grep -aF {shlex.quote(current)} {managers[0]}")
     ''}
 
     with subtest("Actually boot rollback, then its specialisation"):
