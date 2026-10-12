@@ -252,7 +252,7 @@ class BootFile:
 type BootFileList = list[BootFile]
 
 
-libc = ctypes.CDLL("libc.so.6")
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
 FILE = None | int
 
@@ -697,6 +697,35 @@ def uki_identifier(image: PEImage) -> str:
     return image.digest(certificate)
 
 
+# Payload sections ukify can add but this builder never does.
+FOREIGN_UKI_SECTIONS = (
+    ".ucode",
+    ".splash",
+    ".pcrsig",
+    ".pcrpkey",
+    ".profile",
+    ".dtbauto",
+    ".hwids",
+    ".efifw",
+)
+
+
+def payload_mismatch(
+    payload: PEImage, expected: dict[str, bytes], *, skip: str | None = None
+) -> str | None:
+    sections = payload.sections()
+    for name, contents in expected.items():
+        if name != skip and (
+            sections.get(name) != contents
+            or payload.header.sections[name].size != len(contents)
+        ):
+            return name
+    for name in (".dtb", *FOREIGN_UKI_SECTIONS):
+        if name not in expected and name in payload.header.sections:
+            return name
+    return None
+
+
 @functools.cache
 def retained_uki_candidates(work: Path) -> dict[bytes, list[Path]]:
     # Index the section table and command line once per installation. Large
@@ -715,7 +744,7 @@ def retained_uki_candidates(work: Path) -> dict[bytes, list[Path]]:
                 candidates.setdefault(
                     file.read(min(section.size, section.raw_size)), []
                 ).append(image)
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             print(
                 f"warning: ignoring unusable retained UKI {image}: {error}",
                 file=sys.stderr,
@@ -729,29 +758,23 @@ def retained_uki_initrd(
     for image in retained_uki_candidates(work).get(expected[".cmdline"], []):
         # Verify a private snapshot, then reuse those exact bytes. The boot
         # partition can otherwise change between reading and sbverify.
-        check_staging_space(work, image.stat().st_size)
         with tempfile.TemporaryDirectory(dir=work, prefix="retained-") as directory:
             snapshot = Path(directory) / "image.efi"
-            shutil.copyfile(image, snapshot)
             try:
+                check_staging_space(work, image.stat().st_size)
+                shutil.copyfile(image, snapshot)
                 verify_signature(snapshot)
                 payload = PEImage.read(snapshot)
-                sections = payload.sections()
                 if image.name != f"{uki_identifier(payload)}-uki.efi":
                     raise ValueError(
                         f"Retained UKI contents do not match their name: {image}"
                     )
-                for name, contents in expected.items():
-                    if name != ".initrd" and (
-                        sections.get(name) != contents
-                        or payload.header.sections[name].size != len(contents)
-                    ):
-                        raise ValueError(
-                            f"Retained UKI payload mismatch: {image}: {name}"
-                        )
-                if sections.get(".dtb") != expected.get(".dtb"):
-                    raise ValueError(f"Retained UKI devicetree mismatch: {image}")
-                initrd = sections.get(".initrd")
+                mismatch = payload_mismatch(payload, expected, skip=".initrd")
+                if mismatch is not None:
+                    raise ValueError(
+                        f"Retained UKI payload mismatch: {image}: {mismatch}"
+                    )
+                initrd = payload.sections().get(".initrd")
                 if (
                     initrd is None
                     or initrd[: len(pristine)] != pristine
@@ -759,11 +782,63 @@ def retained_uki_initrd(
                 ):
                     raise ValueError(f"Retained UKI initrd mismatch: {image}")
                 return bytes(initrd)
-            except (ValueError, subprocess.CalledProcessError) as error:
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                # A full staging filesystem is not a property of the image.
+                if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                    raise
                 print(
                     f"warning: ignoring unusable retained UKI {image}: {error}",
                     file=sys.stderr,
                 )
+    return None
+
+
+def stub_mismatch(payload: PEImage, stub: PEImage) -> str | None:
+    if (payload.header.machine, payload.header.entrypoint) != (
+        stub.header.machine,
+        stub.header.entrypoint,
+    ):
+        return "UKI does not execute the selected systemd-stub"
+    sections = payload.sections()
+    for name, stub_contents in stub.sections().items():
+        section = payload.header.sections.get(name)
+        if name != ".sbat" and (
+            sections.get(name) != stub_contents
+            or section is None
+            or section.size != stub.header.sections[name].size
+        ):
+            return f"UKI stub mismatch: {name}"
+    return None
+
+
+def reusable_installed_uki(
+    expected: dict[str, bytes], work: Path, stub: PEImage, *, current_stub: bool
+) -> Path | None:
+    # Keep a verified image whose payload still matches, even if an older stub
+    # built it, as Lanzaboote does: rollback keeps the stub a generation booted
+    # with, and a stub update does not rewrite every retained generation. The
+    # default generation always runs the selected stub.
+    for image in retained_uki_candidates(work).get(expected[".cmdline"], []):
+        try:
+            payload = PEImage.read(image)
+            if payload_mismatch(payload, expected) is not None:
+                continue
+            if current_stub:
+                mismatch = stub_mismatch(payload, stub)
+                if mismatch is not None:
+                    raise ValueError(mismatch)
+            elif payload.header.machine != stub.header.machine:
+                raise ValueError("UKI is for another architecture")
+            if image.name != f"{uki_identifier(payload)}-uki.efi":
+                raise ValueError("contents do not match the name")
+            verify_signature(image)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(
+                f"warning: not reusing installed UKI {image}: {error}",
+                file=sys.stderr,
+            )
+            continue
+        return image
     return None
 
 
@@ -889,6 +964,13 @@ def uki_boot_file(
                 with source.open("rb") as input_file:
                     shutil.copyfileobj(input_file, output)
     expected[".initrd"] = initrd.read_bytes()
+    stub_payload = PEImage.read(stub)
+    reusable = reusable_installed_uki(
+        expected, work, stub_payload, current_stub=critical
+    )
+    if reusable is not None:
+        shutil.rmtree(directory)
+        return BootFile(reusable.relative_to(BOOT_MOUNT_POINT), CopyWriter(reusable))
     # Reserve room for ukify output and, when signing, a second image. The
     # appender may grow the initrd; recheck its actual size before assembly.
     size = (
@@ -915,44 +997,20 @@ def uki_boot_file(
         )
     verify_signature(image)
     payload = PEImage.read(image)
-    sections = payload.sections()
-    stub_payload = PEImage.read(stub)
-    stub_sections = stub_payload.sections()
-    if (payload.header.machine, payload.header.entrypoint) != (
-        stub_payload.header.machine,
-        stub_payload.header.entrypoint,
-    ):
-        raise ValueError("UKI does not execute the selected systemd-stub")
-    for name, contents in expected.items():
-        if sections.get(name) != contents or payload.header.sections[name].size != len(
-            contents
-        ):
-            raise ValueError(f"UKI payload mismatch: {name}")
-    for name, stub_contents in stub_sections.items():
-        section = payload.header.sections.get(name)
-        if name != ".sbat" and (
-            sections.get(name) != stub_contents
-            or section is None
-            or section.size != stub_payload.header.sections[name].size
-        ):
-            raise ValueError(f"UKI stub mismatch: {name}")
+    mismatch = stub_mismatch(payload, stub_payload)
+    if mismatch is not None:
+        raise ValueError(mismatch)
+    mismatch = payload_mismatch(payload, expected)
+    if mismatch is not None:
+        raise ValueError(f"UKI payload mismatch: {mismatch}")
     identifier = uki_identifier(payload)
-    # Release large payload buffers before reading an installed image.
-    del expected, sections, payload, stub_sections, stub_payload, contents, retained
     relative = NIXOS_DIR / f"{identifier}-uki.efi"
     installed = BOOT_MOUNT_POINT / relative
-    damaged = False
-    if installed.exists():
-        try:
-            verify_signature(installed)
-            damaged = uki_identifier(PEImage.read(installed)) != identifier
-        except (ValueError, subprocess.CalledProcessError):
-            damaged = True
-        if not damaged:
-            shutil.rmtree(directory)
-            return BootFile(relative, CopyWriter(installed))
-        # The name is the verified identity of the new image, so publishing it
-        # over a corrupted or tampered file restores the expected contents.
+    # A valid image with this identity was reused above, so a file here is
+    # damaged. The name is the verified identity of the new image, so
+    # publishing it over a corrupted or tampered file restores its contents.
+    damaged = installed.exists()
+    if damaged:
         print(f"warning: replacing damaged UKI {installed}", file=sys.stderr)
     # Keep only unique, new, verified images until publication. Reinstalling
     # retained generations no longer accumulates images or scratch initrds.
@@ -1056,19 +1114,31 @@ def get_generations(
         for line in gen_lines
     ]
     retained = configurations[-configurationLimit:]
-    if default_config is not None:
-        # The current rollback target can lie outside the newest-N window.
-        # Its specialisations are separate closures, referenced from the root.
+    # The rollback target and the running system can lie outside the newest-N
+    # window. Specialisations are separate closures, referenced from the root.
+    booted = Path("/run/booted-system")
+    protected = (
+        {default_config, *([booted.resolve()] if booted.exists() else [])}
+        if default_config is not None
+        else set()
+    )
+
+    if protected:
+        # Keep only the newest generation of each protected system.
+        newest: dict[Path, SystemIdentifier] = {}
         for generation in configurations:
-            if generation in retained:
-                continue
             directory = system_dir(profile, generation.generation, None)
-            targets = [directory, *(directory / "specialisation").glob("*")]
-            if any(target.resolve() == default_config for target in targets):
-                if configurationLimit > 0:
-                    retained = retained[1:]
-                retained.append(generation)
-                break
+            for target in [directory, *(directory / "specialisation").glob("*")]:
+                if (resolved := target.resolve()) in protected:
+                    newest[resolved] = generation
+        kept = set(newest.values())
+        # Make room by dropping the oldest unprotected generations; keep both
+        # protected systems even if that exceeds the limit.
+        droppable = [g for g in retained if g not in kept]
+        for generation in [g for g in configurations if g in kept - set(retained)]:
+            if configurationLimit > 0 and droppable:
+                retained.remove(droppable.pop(0))
+            retained.append(generation)
         retained.sort(key=lambda generation: generation.generation)
     return retained
 
@@ -1295,9 +1365,14 @@ def install_bootloader_staged(args: argparse.Namespace, work: Path) -> None:
 
     write_boot_files(boot_files, critical_paths)
 
+    # FAT does not order metadata updates. Make new images and entries durable
+    # before loader.conf names them, and that before old files are removed.
+    if UKI_CONFIG["enable"]:
+        sync_boot_filesystems(required=True)
     write_loader_conf(default_entry_id)
 
     if UKI_CONFIG["enable"]:
+        sync_boot_filesystems(required=True)
         garbage_collect(boot_files)
 
     remove_extra_files()
@@ -1344,6 +1419,20 @@ def garbage_collect(gc_roots: BootFileList) -> None:
             delete_path(e)
 
 
+def sync_boot_filesystems(*, required: bool) -> None:
+    for mount_point in dict.fromkeys((BOOT_MOUNT_POINT, EFI_SYS_MOUNT_POINT)):
+        fd = os.open(mount_point, os.O_RDONLY)
+        try:
+            if libc.syncfs(fd) == 0:
+                continue
+            error = ctypes.get_errno()
+        finally:
+            os.close(fd)
+        if required:
+            raise OSError(error, f"Could not sync {mount_point}", str(mount_point))
+        print(f"could not sync {mount_point}: {os.strerror(error)}", file=sys.stderr)
+
+
 def write_boot_files(boot_files: BootFileList, critical_paths: set[Path]) -> None:
     # Deduplicate by destination path so shared files are written once.
     seen: set[Path] = set()
@@ -1380,19 +1469,7 @@ def main() -> None:
         # it can leave the system in an unbootable state, when a crash/outage
         # happens shortly after an update. To decrease the likelihood of this
         # event sync the efi filesystem after each update.
-        rc = libc.syncfs(os.open(f"{BOOT_MOUNT_POINT}", os.O_RDONLY))
-        if rc != 0:
-            print(
-                f"could not sync {BOOT_MOUNT_POINT}: {os.strerror(rc)}", file=sys.stderr
-            )
-
-        if BOOT_MOUNT_POINT != EFI_SYS_MOUNT_POINT:
-            rc = libc.syncfs(os.open(EFI_SYS_MOUNT_POINT, os.O_RDONLY))
-            if rc != 0:
-                print(
-                    f"could not sync {EFI_SYS_MOUNT_POINT}: {os.strerror(rc)}",
-                    file=sys.stderr,
-                )
+        sync_boot_filesystems(required=False)
 
 
 if __name__ == "__main__":

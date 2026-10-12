@@ -435,6 +435,60 @@ in
             machine.succeed("${pkgs.python3}/bin/python3 -c " + shlex.quote(script))
             check_replaced(second_image)
 
+    with subtest("Older-stub images are kept for old generations, not the default"):
+        builder = machine.succeed(
+            "grep -o '/nix/store/[^ ]*-systemd-boot/bin/systemd-boot' ${nodes.second.system.build.installBootLoader} | head -1"
+        ).strip()
+
+        def with_older_stub(image):
+            # Mark the stub as older, re-sign, and name the image by its identity.
+            machine.succeed(f"cp {image} /root/old-stub.efi")
+            machine.succeed(r"sed -i 's/#### LoaderInfo: systemd-stub [0-9]/#### LoaderInfo: systemd-stub 0/' /root/old-stub.efi")
+            if ${if signed then "True" else "False"}:
+                machine.succeed("${pkgs.sbsigntool}/bin/sbattach --remove /root/old-stub.efi")
+                machine.succeed(f"${pkgs.sbsigntool}/bin/sbsign --key /var/lib/sbctl/keys/db/db.key --cert {certificate} --output /root/old-stub-signed.efi /root/old-stub.efi")
+                machine.succeed("mv /root/old-stub-signed.efi /root/old-stub.efi")
+            identity = machine.succeed(
+                f"$(sed -n '1s/^#! *\\([^ ]*\\).*/\\1/p' {builder}) -c "
+                + shlex.quote(
+                    "import importlib.machinery as m, importlib.util as u; "
+                    f"l = m.SourceFileLoader('builder', {builder!r}); b = u.module_from_spec(u.spec_from_loader('builder', l)); l.exec_module(b); "
+                    "print(b.uki_identifier(b.PEImage.read(b.Path('/root/old-stub.efi'))))"
+                )
+            ).strip()
+            older = f"/boot/EFI/nixos/{identity}-uki.efi"
+            machine.succeed(f"mv /root/old-stub.efi {older}; rm {image}")
+            return older
+
+        old_first = with_older_stub(first_image)
+        old_second = with_older_stub(second_image)
+        old_first_hash = machine.succeed(f"sha256sum {old_first}")
+        machine.succeed(f"{second}/bin/switch-to-configuration boot")
+        assert image_for(2) == old_first
+        assert machine.succeed(f"sha256sum {old_first}") == old_first_hash
+        assert image_for(3) == second_image
+        machine.fail(f"test -e {old_second}")
+        before = snapshot()
+        machine.succeed(f"{second}/bin/switch-to-configuration boot")
+        assert snapshot() == before
+        # Boot the old generation through its older-stub image.
+        # Entry IDs omit the boot counter, and `preferred` overrides `default`.
+        entry = machine.succeed(
+            "grep -l 'version Generation 2 ' /boot/loader/entries/nixos-*.conf | "
+            "xargs grep -l '^title NixOS$' | xargs basename | sed 's/+[0-9-]*\\.conf$/.conf/'"
+        ).strip()
+        machine.succeed(f"sed -i -e '/^preferred /d' -e 's/^default .*/default {entry}/' {esp}/loader/loader.conf")
+        machine.reboot()
+        check_boot(first, "uki.test=first", 2)
+        # Deleting an image rebuilds it with the current stub.
+        machine.succeed("printf 'disposable-uki-fixture\\n' > /root/uki-secret-first")
+        machine.succeed(f"rm {old_first}")
+        machine.succeed(f"{second}/bin/switch-to-configuration boot")
+        machine.succeed("rm /root/uki-secret-first")
+        assert image_for(2) == first_image
+        machine.reboot()
+        check_boot(second, "uki.test=second", 3)
+
     ${lib.optionalString signed ''
       with subtest("Older or unsigned managers are replaced; newer trusted managers are kept"):
           source = "${nodes.first.systemd.package}/lib/systemd/boot/efi/systemd-bootx64.efi"
@@ -491,5 +545,15 @@ in
         machine.succeed("grep -Fx preserved /boot/EFI/other/keep.efi")
         machine.reboot()
         check_boot(recovery, "uki.specialisation=1", 2, specialisation=True)
+
+    with subtest("The running system survives pruning to configurationLimit"):
+        machine.succeed(f"nix-env -p /nix/var/nix/profiles/system --set {second}")
+        newest = int(machine.succeed("readlink /nix/var/nix/profiles/system | tr -dc 0-9"))
+        machine.succeed(f"${nodes.limitedInstaller.system.build.installBootLoader} {second}")
+        machine.succeed("grep -l 'version Generation 2 ' /boot/loader/entries/nixos-*.conf")
+        machine.reboot()
+        check_boot(second, "uki.test=second", newest)
+        machine.succeed(f"${nodes.limitedInstaller.system.build.installBootLoader} {second}")
+        machine.fail("grep -l 'version Generation 2 ' /boot/loader/entries/nixos-*.conf")
   '';
 }

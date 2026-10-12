@@ -209,14 +209,19 @@ in
 
           Each image contains its own kernel and initrd, including initrd secrets.
           Allow sufficient space on the boot filesystem for all retained images
-          and in `TMPDIR` for new images and assembly scratch files. Unchanged
-          installed images are verified and reused, and damaged ones are
+          and in `TMPDIR` for new images and assembly scratch files. An
+          installed image whose contents still match its generation is verified
+          and reused, even if an older systemd-stub built it, so a systemd
+          update builds images only for new generations and a rollback keeps
+          the stub that generation booted with. Delete an image from the boot
+          filesystem to rebuild it with the current stub. Damaged images are
           rebuilt; they do not accumulate in temporary storage. Set `TMPDIR` to
           a larger filesystem if necessary.
           Existing images are pruned only after new images and entries are installed.
-          Reserve free boot space for replacing every retained image after a
-          systemd update. Generate byte-reproducible extra archives to avoid
-          unnecessary image replacements.
+          Changing the signing key or enabling signing rebuilds every retained
+          image, so reserve boot space for a second set of images first.
+          Generate byte-reproducible extra archives to avoid unnecessary image
+          replacements.
 
           Extra initrd paths are relative to the boot partition (XBOOTLDR if
           configured, otherwise the ESP). Archives declared in
@@ -254,7 +259,8 @@ in
           normal and fallback EFI paths unless the installed manager is
           signed with this certificate and is either the same build or a newer
           version. Other managers are replaced even if newer. A fallback loader
-          that is not systemd-boot is kept.
+          that is not systemd-boot is kept, so firmware that loses its boot
+          entries starts that loader rather than NixOS.
           Key enrollment and firmware boot entry registration are separate
           administrative steps. In signed mode the installer does not run
           `bootctl install/update`, touch EFI variables or apply
@@ -346,7 +352,8 @@ in
         `null` means no limit i.e. all generations
         that have not been garbage collected yet.
         With UKIs enabled, the requested default generation stays within this
-        limit even when rolling back outside the newest generations.
+        limit even when rolling back outside the newest generations, and the
+        running system is kept too, exceeding the limit by one if necessary.
       '';
     };
 
